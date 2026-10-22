@@ -86,18 +86,27 @@ impl FeedCoordinator {
 
     /// Routes a price from `(source, id)` to every asset it feeds. Fallback legs
     /// only write while that asset's primary price is stale.
+    /// For Push sources, `id` is the symbol itself (e.g., "SOL/USD").
     pub fn ingest(&self, source: Source, id: &str, price: f64, timestamp: i64) {
         if !(price.is_finite() && price > 0.0) {
             return;
         }
         let now = now_ms();
         for a in &config::get().assets {
-            if a.source == source && a.id == id {
-                self.record_tick(&a.symbol, price, timestamp, source.label());
-            } else if a.fallback.as_ref().is_some_and(|f| f.source == source && f.id == id)
-                && self.is_stale(&a.symbol, now)
-            {
-                self.record_tick(&a.symbol, price, timestamp, &format!("{}-fallback", source.label()));
+            // For Push sources, match by symbol directly
+            if source == config::Source::Push {
+                if a.symbol == id {
+                    self.record_tick(&a.symbol, price, timestamp, source.label());
+                }
+            } else {
+                // Standard source matching
+                if a.source == source && a.id == id {
+                    self.record_tick(&a.symbol, price, timestamp, source.label());
+                } else if a.fallback.as_ref().is_some_and(|f| f.source == source && f.id == id)
+                    && self.is_stale(&a.symbol, now)
+                {
+                    self.record_tick(&a.symbol, price, timestamp, &format!("{}-fallback", source.label()));
+                }
             }
         }
     }
@@ -134,6 +143,10 @@ impl FeedCoordinator {
         info!("Starting ingestion feeds from config...");
         let cfg = config::get();
         for source in Source::ALL {
+            // Skip push sources - they don't poll, they receive data via POST
+            if source == config::Source::Push {
+                continue;
+            }
             let ids = cfg.ids_for(source);
             if ids.is_empty() {
                 continue;
@@ -174,7 +187,7 @@ async fn poll(coord: FeedCoordinator, source: Source, every: Duration) {
             Source::Hyperliquid => hyperliquid::fetch_mids(&client, &ids).await,
             Source::Jupiter => jupiter::fetch_prices(&client, &ids).await,
             Source::Yahoo => yahoo::fetch_spots(&client, &ids).await,
-            Source::BinanceWs => unreachable!("binance-ws is streamed, not polled"),
+            Source::BinanceWs | Source::Push => unreachable!("binance-ws is streamed, push is external"),
         };
         match res {
             Ok(prices) => {

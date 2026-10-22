@@ -2,14 +2,14 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::auth::AuthManager;
-use crate::config::clamp_effective_ttl;
+use crate::auth::{AuthManager, ApiKeyScope};
+use crate::config::{self, clamp_effective_ttl};
 use crate::feed::FeedCoordinator;
 use crate::server::validator::{clamp_limit, clamp_window_ms, validate_interval, validate_symbol};
 
@@ -49,6 +49,19 @@ pub struct StatsQuery {
     pub key: Option<String>,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct PushTickPayload {
+    pub symbol: String,
+    pub price: f64,
+    #[serde(default)]
+    pub timestamp: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct PushTicksRequest {
+    pub ticks: Vec<PushTickPayload>,
+}
+
 fn authenticate_request(headers: &HeaderMap, query_key: Option<&str>, auth: &AuthManager) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let key = headers
         .get("x-api-key")
@@ -86,7 +99,7 @@ pub fn create_rest_router(feed: FeedCoordinator, auth: AuthManager) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/price", get(get_price_handler))
-        .route("/api/v1/ticks", get(get_ticks_handler))
+        .route("/api/v1/ticks", get(get_ticks_handler).post(post_ticks_handler))
         .route("/api/v1/candles", get(get_candles_handler))
         .route("/api/v1/stats", get(get_stats_handler))
         .route("/openapi.json", get(openapi_handler))
@@ -187,6 +200,84 @@ async fn get_ticks_handler(
         })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
     }
+}
+
+async fn post_ticks_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<PushTicksRequest>,
+) -> impl IntoResponse {
+    // 1. Authenticate and check write scope
+    let key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim_start_matches("Bearer ").trim())
+        });
+
+    match key {
+        Some(k) => match state.auth.authenticate_with_scope(k, ApiKeyScope::Write) {
+            Ok(_) => {},
+            Err(e) => return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ).into_response(),
+        },
+        None => return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Missing x-api-key header or Authorization header" })),
+        ).into_response(),
+    }
+
+    // 2. Validate and ingest each tick
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let mut ingested = 0;
+    let mut errors = Vec::new();
+
+    for tick in payload.ticks {
+        // Validate symbol
+        let symbol = tick.symbol.trim().to_uppercase();
+        if !config::is_supported_symbol(&symbol) {
+            errors.push(format!("Symbol '{}' is not configured", symbol));
+            continue;
+        }
+
+        // Validate price
+        if !tick.price.is_finite() || tick.price <= 0.0 {
+            errors.push(format!("Invalid price {} for symbol '{}'", tick.price, symbol));
+            continue;
+        }
+
+        // Use provided timestamp or current time
+        let timestamp = tick.timestamp.unwrap_or(now);
+
+        // Ingest through the feed coordinator (same path as pollers)
+        state.feed.ingest(config::Source::Push, &symbol, tick.price, timestamp);
+        ingested += 1;
+    }
+
+    if ingested == 0 && !errors.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "All ticks failed validation",
+                "details": errors
+            })),
+        ).into_response();
+    }
+
+    Json(serde_json::json!({
+        "success": true,
+        "ingested": ingested,
+        "errors": if errors.is_empty() { None } else { Some(errors) }
+    })).into_response()
 }
 
 async fn get_candles_handler(
@@ -425,6 +516,40 @@ async fn openapi_handler() -> impl IntoResponse {
                         "error": { "type": "string", "example": "Invalid or unrecognized API key" }
                     },
                     "required": ["error"]
+                },
+                "PushTickPayload": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "example": "SOL/USD", "description": "Market symbol (must be configured in assets)" },
+                        "price": { "type": "number", "example": 152.34, "description": "Price value (must be > 0 and finite)" },
+                        "timestamp": { "type": "integer", "format": "int64", "example": 1700000000000i64, "description": "Unix epoch in milliseconds (optional, defaults to server time)" }
+                    },
+                    "required": ["symbol", "price"]
+                },
+                "PushTicksRequest": {
+                    "type": "object",
+                    "properties": {
+                        "ticks": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/PushTickPayload" },
+                            "minItems": 1,
+                            "description": "Array of price ticks to ingest"
+                        }
+                    },
+                    "required": ["ticks"]
+                },
+                "PushTicksResponse": {
+                    "type": "object",
+                    "properties": {
+                        "success": { "type": "boolean", "example": true },
+                        "ingested": { "type": "integer", "example": 5, "description": "Number of ticks successfully ingested" },
+                        "errors": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Validation errors for failed ticks (if any)"
+                        }
+                    },
+                    "required": ["success", "ingested"]
                 }
             }
         },
@@ -551,6 +676,51 @@ async fn openapi_handler() -> impl IntoResponse {
                         "400": { "description": "Invalid parameters" },
                         "401": { "description": "Unauthorized" }
                     }
+                },
+                "post": {
+                    "tags": ["Market Data"],
+                    "summary": "Push external price ticks",
+                    "description": "Allows external services with write-scoped API keys to push price data into mso. Pushed ticks flow through the same ingestion pipeline: cache, broadcast, SQLite, and candle rollups. Use this for custom data sources, computed prices, or off-chain feeds.",
+                    "security": [
+                        { "ApiKeyHeader": [] },
+                        { "BearerAuth": [] }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/PushTicksRequest" },
+                                "example": {
+                                    "ticks": [
+                                        { "symbol": "SOL/USD", "price": 152.34, "timestamp": 1700000000000i64 },
+                                        { "symbol": "BTC/USD", "price": 45123.50 }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Ticks ingested successfully",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/PushTicksResponse" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "All ticks failed validation",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                        },
+                        "401": {
+                            "description": "Missing API key",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                        },
+                        "403": {
+                            "description": "API key requires write scope",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+                        }
+                    }
                 }
             },
             "/api/v1/candles": {
@@ -667,7 +837,7 @@ mod tests {
         let feed = FeedCoordinator::new(db.clone());
 
         // Create an API key
-        let (_id, secret) = auth.create_key("integration-test-app", None).unwrap();
+        let (_id, secret) = auth.create_key("integration-test-app", None, crate::auth::ApiKeyScope::Read).unwrap();
 
         // Record a tick into L1 cache and DB
         feed.record_tick("SOL/USD", 150.50, 1700000000000, "test-feed");

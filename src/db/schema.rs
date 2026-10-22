@@ -68,7 +68,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             key_hash TEXT NOT NULL UNIQUE,
             created_at INTEGER NOT NULL,
             expires_at INTEGER,          -- NULL = unlimited/permanent
-            is_revoked INTEGER NOT NULL DEFAULT 0
+            is_revoked INTEGER NOT NULL DEFAULT 0,
+            scope TEXT NOT NULL DEFAULT 'read'  -- 'read' or 'write'
         );
         CREATE INDEX IF NOT EXISTS idx_api_keys_lookup ON api_keys(key_hash);
         "#,
