@@ -173,7 +173,8 @@ impl AuthManager {
 
     pub fn authenticate_with_scope(&self, raw_key: &str, required_scope: ApiKeyScope) -> Result<ApiKeyMetadata, AuthError> {
         let meta = self.authenticate(raw_key)?;
-        if required_scope == ApiKeyScope::Write && meta.scope != ApiKeyScope::Write {
+        // Strict scope enforcement: read keys can only read, write keys can only write
+        if meta.scope != required_scope {
             return Err(AuthError::InsufficientScope);
         }
         Ok(meta)
@@ -211,7 +212,7 @@ mod tests {
     #[test]
     fn test_auth_workflow() {
         let db = DbManager::in_memory().unwrap();
-        let auth = AuthManager::new(db).unwrap();
+        let auth = AuthManager::new(db.clone()).unwrap();
 
         // 1. Create read key
         let (id, secret) = auth.create_key("test-app", Some(60_000), ApiKeyScope::Read).unwrap();
@@ -234,15 +235,20 @@ mod tests {
         // 5. Authenticate revoked key
         assert!(matches!(auth.authenticate(&secret), Err(AuthError::RevokedKey)));
 
-        // 6. Test write scope
-        let (_wid, wsecret) = auth.create_key("writer-app", None, ApiKeyScope::Write).unwrap();
-        let wmeta = auth.authenticate_with_scope(&wsecret, ApiKeyScope::Write).unwrap();
+        // 6. Test write scope with fresh AuthManager (Issue #15)
+        let (wid, wsecret) = auth.create_key("writer-app", None, ApiKeyScope::Write).unwrap();
+
+        // Reload cache from DB to ensure consistency
+        let auth2 = AuthManager::new(db).unwrap();
+        let wmeta = auth2.authenticate_with_scope(&wsecret, ApiKeyScope::Write).unwrap();
         assert_eq!(wmeta.scope, ApiKeyScope::Write);
+        assert_eq!(wmeta.id, wid);
 
         // 7. Test insufficient scope
-        let (_rid, rsecret) = auth.create_key("reader-app", None, ApiKeyScope::Read).unwrap();
+        let (_rid, rsecret) = auth2.create_key("reader-app", None, ApiKeyScope::Read).unwrap();
+        let auth3 = AuthManager::new(auth2.db.clone()).unwrap();
         assert!(matches!(
-            auth.authenticate_with_scope(&rsecret, ApiKeyScope::Write),
+            auth3.authenticate_with_scope(&rsecret, ApiKeyScope::Write),
             Err(AuthError::InsufficientScope)
         ));
     }
