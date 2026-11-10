@@ -2,7 +2,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json},
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -158,7 +158,10 @@ async fn get_price_handler(
 
     // 1. Check L1 in-memory hot cache
     if let Some(entry) = state.feed.l1_cache.get(&symbol) {
-        let age = (now - entry.cached_at) as u64;
+        // Freshness must account for the tick's own timestamp, not just when it
+        // was cached: a pushed tick with an old payload timestamp must not be
+        // served as fresh merely because it arrived recently.
+        let age = (now - entry.timestamp).max(now - entry.cached_at) as u64;
         if age <= effective_ttl {
             return Json(serde_json::json!({
                 "symbol": entry.symbol,
@@ -235,7 +238,7 @@ async fn post_ticks_handler(
 
     if payload.ticks.len() > MAX_BATCH_SIZE {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "error": format!("Batch size {} exceeds maximum allowed {}", payload.ticks.len(), MAX_BATCH_SIZE)
             })),
@@ -291,10 +294,11 @@ async fn post_ticks_handler(
     let mut tick_counter: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
     for tick in payload.ticks {
-        // Validate symbol (Issue #5)
+        // Validate symbol: must be configured AND fed by a push source.
+        // A write key can never overwrite a polled market price (binance & co).
         let symbol = tick.symbol.trim().to_uppercase();
-        if !config::is_supported_symbol(&symbol) {
-            errors.push(format!("Symbol '{}' is not configured", symbol));
+        if !config::is_push_symbol(&symbol) {
+            errors.push(format!("Symbol '{}' is not configured for push ingestion", symbol));
             continue;
         }
 
@@ -924,7 +928,7 @@ async fn openapi_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request;
+    use axum::http::{Method, Request};
     use tower::ServiceExt;
     use crate::db::DbManager;
 
@@ -937,8 +941,10 @@ mod tests {
         // Create an API key
         let (_id, secret) = auth.create_key("integration-test-app", None, crate::auth::ApiKeyScope::Read).unwrap();
 
-        // Record a tick into L1 cache and DB
-        feed.record_tick("SOL/USD", 150.50, 1700000000000, "test-feed");
+        // Record a tick into L1 cache and DB (current time: /price freshness
+        // counts from the tick's own timestamp, so a hardcoded old timestamp
+        // would be served as stale)
+        feed.record_tick("SOL/USD", 150.50, crate::feed::now_ms(), "test-feed");
 
         let app = create_rest_router(feed, auth);
 
@@ -1046,5 +1052,218 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(openapi.status(), StatusCode::OK);
+    }
+
+    // ---------- POST /api/v1/ticks (push ingestion) ----------
+    // FUND-A/NAV is the push-fed asset added to the shared test config
+    // (see config::install_test_config); all other assets are polled.
+
+    fn test_app() -> (Router, String, String) {
+        let db = DbManager::in_memory().unwrap();
+        let auth = AuthManager::new(db.clone()).unwrap();
+        let feed = FeedCoordinator::new(db.clone());
+        let (_rid, read_key) = auth.create_key("read-app", None, ApiKeyScope::Read).unwrap();
+        let (_wid, write_key) = auth.create_key("write-app", None, ApiKeyScope::Write).unwrap();
+        (create_rest_router(feed, auth), read_key, write_key)
+    }
+
+    async fn post_ticks(
+        app: &Router,
+        key: Option<&str>,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/ticks")
+            .header("content-type", "application/json");
+        if let Some(k) = key {
+            builder = builder.header("x-api-key", k);
+        }
+        app.clone()
+            .oneshot(builder.body(axum::body::Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn get_price(app: &Router, read_key: &str, symbol: &str) -> (StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/price?symbol={}&key={}", symbol, read_key))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, body_json(res).await)
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 10_000_000).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn tick(symbol: &str, price: f64) -> serde_json::Value {
+        serde_json::json!({ "symbol": symbol, "price": price })
+    }
+
+    #[tokio::test]
+    async fn test_post_ticks_auth() {
+        let (app, read_key, write_key) = test_app();
+        let body = serde_json::json!({ "ticks": [tick("FUND-A/NAV", 12.34)] });
+
+        // No key -> 401
+        let res = post_ticks(&app, None, body.clone()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Read-only key -> 403
+        let res = post_ticks(&app, Some(&read_key), body.clone()).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Write key + push-fed asset -> 200, one ingested
+        let res = post_ticks(&app, Some(&write_key), body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["success"], serde_json::json!(true));
+        assert_eq!(json["ingested"], serde_json::json!(1));
+        assert_eq!(json["errors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_post_ticks_rejects_polled_assets() {
+        let (app, read_key, write_key) = test_app();
+
+        // Binance-ws and binance assets are pull-only: a write key can never
+        // overwrite a polled market price
+        let body = serde_json::json!({ "ticks": [tick("SOL/USD", 150.0), tick("BTC/USD", 45_000.0)] });
+        let res = post_ticks(&app, Some(&write_key), body).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(res).await;
+        assert_eq!(json["ingested"], serde_json::json!(0));
+        let errors = json["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].as_str().unwrap().contains("push"));
+
+        // Nothing was written: the polled symbol still has no price data at all
+        let (status, _) = get_price(&app, &read_key, "SOL/USD").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_post_ticks_timestamp_validation() {
+        let (app, _read, write_key) = test_app();
+        let now = crate::feed::now_ms();
+
+        // More than 60s into the future -> rejected
+        let res = post_ticks(&app, Some(&write_key), serde_json::json!({
+            "ticks": [{ "symbol": "FUND-A/NAV", "price": 12.0, "timestamp": now + 120_000 }]
+        })).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(res).await["ingested"], serde_json::json!(0));
+
+        // More than 24h old -> rejected
+        let res = post_ticks(&app, Some(&write_key), serde_json::json!({
+            "ticks": [{ "symbol": "FUND-A/NAV", "price": 12.0, "timestamp": now - 25 * 3_600_000 }]
+        })).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(res).await["ingested"], serde_json::json!(0));
+
+        // Slightly old (1 minute) is fine
+        let res = post_ticks(&app, Some(&write_key), serde_json::json!({
+            "ticks": [{ "symbol": "FUND-A/NAV", "price": 12.0, "timestamp": now - 60_000 }]
+        })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["ingested"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn test_post_ticks_batch_size_limit() {
+        let (app, _read, write_key) = test_app();
+        let ticks: Vec<serde_json::Value> = (0..=MAX_BATCH_SIZE)
+            .map(|i| serde_json::json!({ "symbol": "FUND-A/NAV", "price": 1.0 + i as f64 }))
+            .collect();
+        let res = post_ticks(&app, Some(&write_key), serde_json::json!({ "ticks": ticks })).await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_post_ticks_mixed_batch() {
+        let (app, read_key, write_key) = test_app();
+        let body = serde_json::json!({
+            "ticks": [
+                { "symbol": "FUND-A/NAV", "price": 12.3456 }, // valid push asset
+                { "symbol": "SOL/USD", "price": 150.0 },      // polled asset -> rejected
+                { "symbol": "FUND-A/NAV", "price": -1.0 },    // bad price -> rejected
+            ]
+        });
+
+        // Partial success: the valid tick applies, the invalid ones are reported
+        let res = post_ticks(&app, Some(&write_key), body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["success"], serde_json::json!(true));
+        assert_eq!(json["ingested"], serde_json::json!(1));
+        assert_eq!(json["errors"].as_array().unwrap().len(), 2);
+
+        // The valid tick is readable back through /price
+        let (status, json) = get_price(&app, &read_key, "FUND-A/NAV").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["price"], serde_json::json!(12.3456));
+        assert_eq!(json["source"], serde_json::json!("push"));
+        assert_eq!(json["is_stale"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_post_ticks_bearer_auth() {
+        let (app, _read, write_key) = test_app();
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ticks")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", write_key))
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "ticks": [tick("FUND-A/NAV", 99.9)] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["ingested"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn test_pushed_stale_tick_is_reported_stale() {
+        let (app, read_key, write_key) = test_app();
+        let now = crate::feed::now_ms();
+
+        // A tick whose payload timestamp is 2h old (inside the 24h batch window)
+        let res = post_ticks(&app, Some(&write_key), serde_json::json!({
+            "ticks": [{ "symbol": "FUND-A/NAV", "price": 55.0, "timestamp": now - 2 * 3_600_000 }]
+        })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // /price must not present it as fresh: age counts from the tick's own
+        // timestamp, not from when the server cached it
+        let (status, json) = get_price(&app, &read_key, "FUND-A/NAV").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["price"], serde_json::json!(55.0));
+        assert_eq!(json["timestamp"], serde_json::json!(now - 2 * 3_600_000));
+        assert_eq!(json["is_stale"], serde_json::json!(true));
+
+        // A fresh push over it is reported fresh again
+        let res = post_ticks(&app, Some(&write_key), serde_json::json!({
+            "ticks": [{ "symbol": "FUND-A/NAV", "price": 56.0, "timestamp": now }]
+        })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let (status, json) = get_price(&app, &read_key, "FUND-A/NAV").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["price"], serde_json::json!(56.0));
+        assert_eq!(json["is_stale"], serde_json::json!(false));
     }
 }

@@ -210,11 +210,36 @@ pub fn init(cfg: Config) {
 
 /// Active config; the built-in default if `init` was never called (tests, key commands).
 pub fn get() -> &'static Config {
+    #[cfg(test)]
+    install_test_config();
     CONFIG.get_or_init(|| Config::parse("").expect("built-in config is valid"))
+}
+
+#[cfg(test)]
+fn install_test_config() {
+    // The whole test binary shares one global config (OnceLock), and `init`
+    // panics if called twice. Give tests a push-fed asset on top of the
+    // built-in defaults so POST /api/v1/ticks can be exercised end to end.
+    // First caller wins; every test sees the same config either way.
+    let mut cfg = Config::parse("").expect("built-in config is valid");
+    cfg.assets.push(Asset {
+        symbol: "FUND-A/NAV".to_string(),
+        source: Source::Push,
+        id: "fund-a".to_string(),
+        fallback: None,
+    });
+    let _ = CONFIG.set(cfg);
 }
 
 pub fn is_supported_symbol(symbol: &str) -> bool {
     get().asset(symbol).is_some()
+}
+
+/// True when the symbol is configured **and** fed by a push source.
+/// Write-scoped keys may only push to push-fed assets; a pushed tick must
+/// never overwrite a price from a polled source (binance and the others).
+pub fn is_push_symbol(symbol: &str) -> bool {
+    get().asset(symbol).is_some_and(|a| a.source == Source::Push)
 }
 
 pub fn supported_symbols() -> String {
@@ -316,7 +341,10 @@ mod tests {
     #[test]
     fn test_default_assets_and_sources() {
         let cfg = get();
-        assert_eq!(cfg.assets.len(), 11);
+        // 11 built-in assets + the push-fed FUND-A/NAV added for tests
+        assert_eq!(cfg.assets.len(), 12);
+        assert!(is_push_symbol("FUND-A/NAV"));
+        assert!(!is_push_symbol("SOL/USD")); // polled asset: never pushable
         assert_eq!(cfg.ids_for(Source::BinanceWs), vec!["SOLUSDT"]);
         assert_eq!(cfg.ids_for(Source::Binance), vec!["BTCUSDT", "ETHUSDT", "ZECUSDT", "PAXGUSDT", "HYPEUSDT"]);
         assert_eq!(cfg.ids_for(Source::Hyperliquid), vec!["SOL", "BTC", "ETH", "ZEC", "HYPE"]);

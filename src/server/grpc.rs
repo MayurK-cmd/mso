@@ -10,7 +10,7 @@ use proto::oracle_service_server::OracleService;
 pub use proto::oracle_service_server::OracleServiceServer;
 use proto::*;
 
-use crate::auth::AuthManager;
+use crate::auth::{AuthError, ApiKeyScope, AuthManager};
 use crate::config::clamp_effective_ttl;
 use crate::feed::FeedCoordinator;
 use crate::server::validator::{clamp_limit, clamp_window_ms, validate_symbol};
@@ -40,9 +40,15 @@ impl GrpcOracleService {
         match api_key {
             Some(key) => self
                 .auth
-                .authenticate(key)
+                // Scope enforcement must be consistent with REST reads: a
+                // write-only key must not be able to stream market data.
+                .authenticate_with_scope(key, ApiKeyScope::Read)
                 .map(|_| ())
-                .map_err(|e| Status::unauthenticated(e.to_string())),
+                .map_err(|e| match e {
+                    // Valid key, but its scope doesn't allow reading.
+                    AuthError::InsufficientScope => Status::permission_denied(e.to_string()),
+                    _ => Status::unauthenticated(e.to_string()),
+                }),
             None => Err(Status::unauthenticated("Missing x-api-key metadata header")),
         }
     }
@@ -70,7 +76,9 @@ impl OracleService for GrpcOracleService {
 
         // 1. Check L1 In-Memory Cache
         if let Some(entry) = self.feed.l1_cache.get(&symbol) {
-            let age = (now - entry.cached_at) as u64;
+            // Freshness counts from the tick's own timestamp (same rule as REST):
+            // an old pushed tick must not look fresh just because it arrived recently.
+            let age = (now - entry.timestamp).max(now - entry.cached_at) as u64;
             if age <= effective_ttl {
                 return Ok(Response::new(PriceResponse {
                     symbol: entry.symbol.clone(),
@@ -239,5 +247,41 @@ impl OracleService for GrpcOracleService {
             .collect();
 
         Ok(Response::new(TicksResponse { symbol, samples }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::ApiKeyScope;
+    use crate::db::DbManager;
+    use crate::feed::FeedCoordinator;
+
+    #[tokio::test]
+    async fn test_grpc_enforces_read_scope() {
+        let db = DbManager::in_memory().unwrap();
+        let auth = AuthManager::new(db.clone()).unwrap();
+        let (_rid, read_key) = auth.create_key("reader", None, ApiKeyScope::Read).unwrap();
+        let (_wid, write_key) = auth.create_key("writer", None, ApiKeyScope::Write).unwrap();
+        let service = GrpcOracleService::new(FeedCoordinator::new(db), auth);
+
+        // A write-only key is a valid credential but has no read scope:
+        // it must be rejected with permission_denied, not unauthenticated.
+        let mut req = Request::new(PriceRequest {
+            symbol: "SOL/USD".into(),
+            ..Default::default()
+        });
+        req.metadata_mut().insert("x-api-key", write_key.parse().unwrap());
+        let err = service.get_price(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // A read key passes auth (SOL/USD simply has no data yet -> not_found)
+        let mut req = Request::new(PriceRequest {
+            symbol: "SOL/USD".into(),
+            ..Default::default()
+        });
+        req.metadata_mut().insert("x-api-key", read_key.parse().unwrap());
+        let err = service.get_price(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }
